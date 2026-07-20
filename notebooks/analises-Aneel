@@ -1,0 +1,400 @@
+"""
+Script para buscar dados de usinas de energia da ANEEL e exportar para Excel
+Autor: Seu Nome
+Data: Julho 2026
+"""
+
+import json
+import requests
+import pandas as pd
+from datetime import datetime
+import time
+
+# ============================================
+# CONFIGURAÇÕES
+# ============================================
+
+ANEEL_DATASTORE_URL = "https://dadosabertos.aneel.gov.br/api/3/action/datastore_search"
+SIGA_DAILY_RESOURCE_ID = "2f65a1b0-19b8-4360-8238-b34ab4693d55"
+
+# ============================================
+# FUNÇÕES AUXILIARES
+# ============================================
+
+def parse_brazilian_number(value):
+    """Converte número no formato brasileiro (vírgula decimal) para float"""
+    if value is None or value == "":
+        return None
+    try:
+        # Remove espaços e substitui vírgula por ponto
+        cleaned = str(value).strip().replace(",", ".")
+        return float(cleaned)
+    except ValueError:
+        return None
+
+def kw_to_mw(value):
+    """Converte quilowatts para megawatts"""
+    kw = parse_brazilian_number(value)
+    if kw is None:
+        return 0
+    return kw / 1000
+
+def classify_renewable_type(value):
+    """Classifica o tipo de fonte de energia renovável"""
+    if value is None:
+        return None
+    
+    source = str(value).lower()
+    
+    if "vento" in source:
+        return "Eólica"
+    if "sol" in source or "fotovoltaica" in source or "radiação solar" in source:
+        return "Solar"
+    if "hidráulico" in source or "hídrica" in source or "potencial hidráulico" in source:
+        return "Hidro"
+    if "cana" in source or "biogás" in source or "biomassa" in source or "florestais" in source or "licor" in source:
+        return "Biomassa"
+    
+    return None
+
+def is_valid_coordinate(lat, lng):
+    """Verifica se as coordenadas são válidas"""
+    if lat is None or lng is None:
+        return False
+    if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
+        return False
+    if lat == 0 and lng == 0:
+        return False
+    return True
+
+def normalize_aneel_record(record):
+    """Normaliza um registro bruto da ANEEL para formato padronizado"""
+    
+    # Extrai cidade e estado
+    city_parts = str(record.get('DscMuninicpios', '')).split(' - ')
+    city = city_parts[0] if city_parts else ''
+    state = record.get('SigUFPrincipal', '')
+    if not state and len(city_parts) > 1:
+        state = city_parts[1]
+    
+    # Classifica o tipo
+    fuel_source = record.get('NomFonteCombustivel') or record.get('DscFonteCombustivel', '')
+    energy_type = classify_renewable_type(fuel_source)
+    
+    # Extrai coordenadas
+    lat = parse_brazilian_number(record.get('NumCoordNEmpreendimento'))
+    lng = parse_brazilian_number(record.get('NumCoordEEmpreendimento'))
+    
+    # Só mantém registros válidos
+    if not energy_type or not is_valid_coordinate(lat, lng):
+        return None
+    
+    return {
+        'id': str(record.get('_id', '')),
+        'name': record.get('NomEmpreendimento', ''),
+        'type': energy_type,
+        'generation_type': record.get('SigTipoGeracao', ''),
+        'phase': record.get('DscFaseUsina', ''),
+        'fuel_origin': record.get('DscOrigemCombustivel', ''),
+        'fuel_source': fuel_source,
+        'grant_type': record.get('DscTipoOutorga', ''),
+        'capacity_mw': kw_to_mw(record.get('MdaPotenciaOutorgadaKw')),
+        'fiscalized_capacity_mw': kw_to_mw(record.get('MdaPotenciaFiscalizadaKw')),
+        'physical_guarantee_mw': kw_to_mw(record.get('MdaGarantiaFisicaKw')),
+        'qualified_generation': record.get('IdcGeracaoQualificada', ''),
+        'owner': record.get('DscPropriRegimePariticipacao', ''),
+        'city': city,
+        'state': state,
+        'lat': lat,
+        'lng': lng,
+        'operation_date': record.get('DatEntradaOperacao', ''),
+        'validity_start': record.get('DatInicioVigencia', ''),
+        'validity_end': record.get('DatFimVigencia', ''),
+        'sub_basin': record.get('DscSubBacia', ''),
+        'source_date': record.get('DatGeracaoConjuntoDados', ''),
+        'ceg_code': record.get('CodCEG', '')
+    }
+
+# ============================================
+# FUNÇÃO PRINCIPAL DE BUSCA
+# ============================================
+
+def fetch_aneel_data(resource_id, page_size=5000, max_records=None):
+    """
+    Busca todos os registros da API da ANEEL
+    
+    Args:
+        resource_id: ID do recurso na ANEEL
+        page_size: Quantos registros por página
+        max_records: Número máximo de registros para buscar (None = todos)
+    
+    Returns:
+        Lista de registros normalizados
+    """
+    print(f"🔄 Buscando dados da ANEEL...")
+    
+    all_records = []
+    offset = 0
+    total = None
+    
+    while True:
+        # Monta a URL com parâmetros
+        params = {
+            "resource_id": resource_id,
+            "limit": page_size,
+            "offset": offset
+        }
+        
+        try:
+            # Faz a requisição
+            print(f"  📥 Baixando página {offset//page_size + 1}...", end="")
+            response = requests.get(ANEEL_DATASTORE_URL, params=params, timeout=30)
+            response.raise_for_status()
+            
+            data = response.json()
+            result = data.get('result', {})
+            records = result.get('records', [])
+            
+            # Primeira página: define o total
+            if total is None:
+                total = result.get('total', 0)
+                print(f" (Total: {total} registros)")
+            
+            if not records:
+                print("\n  ✅ Todos os registros baixados!")
+                break
+            
+            # Normaliza e filtra os registros
+            for record in records:
+                normalized = normalize_aneel_record(record)
+                if normalized:
+                    all_records.append(normalized)
+            
+            print(f" {len(records)} registros, {len(all_records)} válidos até agora")
+            
+            # Atualiza offset
+            offset += len(records)
+            
+            # Verifica se já baixou tudo ou atingiu o limite
+            if offset >= total or (max_records and len(all_records) >= max_records):
+                break
+                
+            # Pequena pausa para não sobrecarregar a API
+            time.sleep(0.5)
+            
+        except requests.exceptions.RequestException as e:
+            print(f"\n❌ Erro na requisição: {e}")
+            break
+        except json.JSONDecodeError as e:
+            print(f"\n❌ Erro ao decodificar JSON: {e}")
+            break
+    
+    print(f"✅ Busca concluída! {len(all_records)} registros válidos encontrados.")
+    return all_records
+
+# ============================================
+# FUNÇÃO PARA EXPORTAR PARA EXCEL
+# ============================================
+
+def export_to_excel(data, filename, sheet_name='Usinas'):
+    """
+    Exporta os dados para um arquivo Excel
+    
+    Args:
+        data: Lista de dicionários
+        filename: Nome do arquivo (ex: 'aneel_data.xlsx')
+        sheet_name: Nome da planilha
+    """
+    if not data:
+        print("⚠️ Sem dados para exportar!")
+        return
+    
+    df = pd.DataFrame(data)
+    
+    # Cria um arquivo Excel com formatação básica
+    with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name=sheet_name, index=False)
+        
+        # Ajusta automaticamente a largura das colunas
+        worksheet = writer.sheets[sheet_name]
+        for column in df.columns:
+            column_width = max(df[column].astype(str).map(len).max(), len(column)) + 2
+            col_idx = df.columns.get_loc(column)
+            worksheet.column_dimensions[chr(65 + col_idx)].width = min(column_width, 50)
+    
+    print(f"✅ Arquivo '{filename}' criado com sucesso!")
+    print(f"   📊 {len(data)} registros, {len(df.columns)} colunas")
+
+# ============================================
+# FUNÇÃO PARA EXPORTAR TODOS OS DADOS PARA EXCEL
+# ============================================
+
+def export_all_to_excel():
+    """
+    Exporta dados da ANEEL para um arquivo Excel com múltiplas abas
+    """
+    print("\n" + "="*60)
+    print("🚀 INICIANDO EXPORTAÇÃO DE DADOS DA ANEEL")
+    print("="*60 + "\n")
+    
+    # Busca os dados
+    data = fetch_aneel_data(SIGA_DAILY_RESOURCE_ID)
+    
+    if not data:
+        print("❌ Nenhum dado foi obtido. Verifique sua conexão com a internet.")
+        return
+    
+    # Cria um DataFrame com todos os dados
+    df = pd.DataFrame(data)
+    
+    # Cria um arquivo Excel com múltiplas abas
+    filename = f'aneel_usinas_{datetime.now().strftime("%Y%m%d")}.xlsx'
+    
+    with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+        # Aba principal: todos os dados
+        df.to_excel(writer, sheet_name='Todos', index=False)
+        
+        # Abas por tipo de energia
+        for energy_type in df['type'].unique():
+            if energy_type:
+                df_filtered = df[df['type'] == energy_type]
+                df_filtered.to_excel(writer, sheet_name=energy_type, index=False)
+        
+        # Aba de resumo estatístico
+        summary = pd.DataFrame({
+            'Tipo': df['type'].value_counts().index,
+            'Quantidade': df['type'].value_counts().values,
+            'Capacidade Total (MW)': df.groupby('type')['capacity_mw'].sum().values,
+            'Capacidade Média (MW)': df.groupby('type')['capacity_mw'].mean().values,
+            'Capacidade Máxima (MW)': df.groupby('type')['capacity_mw'].max().values,
+            'Capacidade Mínima (MW)': df.groupby('type')['capacity_mw'].min().values
+        })
+        summary.to_excel(writer, sheet_name='Resumo', index=False)
+        
+        # Aba por estado
+        state_summary = pd.DataFrame({
+            'Estado': df['state'].value_counts().index,
+            'Quantidade': df['state'].value_counts().values,
+            'Capacidade Total (MW)': df.groupby('state')['capacity_mw'].sum().values
+        })
+        state_summary = state_summary.sort_values('Capacidade Total (MW)', ascending=False)
+        state_summary.to_excel(writer, sheet_name='Por Estado', index=False)
+        
+        # Ajusta largura das colunas para todas as abas
+        for sheet_name in writer.sheets:
+            worksheet = writer.sheets[sheet_name]
+            for column in worksheet.columns:
+                max_length = 0
+                column_letter = column[0].column_letter
+                for cell in column:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                adjusted_width = min(max_length + 2, 50)
+                worksheet.column_dimensions[column_letter].width = adjusted_width
+    
+    print("\n" + "="*60)
+    print("✅ EXPORTAÇÃO CONCLUÍDA COM SUCESSO!")
+    print("="*60)
+    print(f"\n📁 Arquivo gerado: {filename}")
+    print(f"📊 Total de registros: {len(df)}")
+    print(f"📋 Tipos de energia encontrados: {', '.join(df['type'].unique())}")
+    print(f"📍 Estados encontrados: {len(df['state'].unique())}")
+    print("\n📌 O arquivo Excel contém as seguintes abas:")
+    print("   - Todos: Todos os registros")
+    print("   - [Tipo]: Abas separadas por tipo de energia")
+    print("   - Resumo: Estatísticas gerais")
+    print("   - Por Estado: Dados agregados por estado")
+
+# ============================================
+# FUNÇÃO PARA CONVERTER SEU JSON EXISTENTE PARA EXCEL
+# ============================================
+
+def convert_existing_json_to_excel(json_file, excel_file):
+    """
+    Converte um arquivo JSON existente (como energy.json) para Excel
+    
+    Args:
+        json_file: Caminho do arquivo JSON (ex: 'energy.json')
+        excel_file: Nome do arquivo Excel de saída (ex: 'energy.xlsx')
+    """
+    try:
+        with open(json_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        df = pd.DataFrame(data)
+        df.to_excel(excel_file, index=False)
+        print(f"✅ '{json_file}' convertido para '{excel_file}'")
+        print(f"   📊 {len(df)} registros convertidos")
+    except FileNotFoundError:
+        print(f"❌ Arquivo '{json_file}' não encontrado!")
+    except json.JSONDecodeError:
+        print(f"❌ Erro ao ler '{json_file}'. Verifique se é um JSON válido.")
+
+# ============================================
+# FUNÇÃO PRINCIPAL
+# ============================================
+
+def main():
+    """Função principal do script"""
+    print("""
+    ╔══════════════════════════════════════════════════╗
+    ║   📊 EXPORTADOR DE DADOS DA ANEEL PARA EXCEL   ║
+    ╚══════════════════════════════════════════════════╝
+    """)
+    
+    print("Escolha uma opção:")
+    print("1. Buscar dados novos da API da ANEEL")
+    print("2. Converter arquivo JSON existente para Excel")
+    print("3. Fazer ambos (buscar + converter JSON existente)")
+    
+    choice = input("\nDigite sua opção (1, 2 ou 3): ").strip()
+    
+    if choice == '1':
+        export_all_to_excel()
+    
+    elif choice == '2':
+        print("\n📂 Arquivos JSON disponíveis:")
+        import os
+        json_files = [f for f in os.listdir('.') if f.endswith('.json')]
+        for i, f in enumerate(json_files, 1):
+            print(f"   {i}. {f}")
+        
+        if not json_files:
+            print("❌ Nenhum arquivo JSON encontrado no diretório atual!")
+            return
+        
+        file_choice = input("\nDigite o número do arquivo que deseja converter: ").strip()
+        try:
+            idx = int(file_choice) - 1
+            if 0 <= idx < len(json_files):
+                json_file = json_files[idx]
+                excel_file = json_file.replace('.json', '.xlsx')
+                convert_existing_json_to_excel(json_file, excel_file)
+            else:
+                print("❌ Opção inválida!")
+        except ValueError:
+            print("❌ Digite um número válido!")
+    
+    elif choice == '3':
+        print("\n🔄 Buscando dados da ANEEL...")
+        export_all_to_excel()
+        
+        print("\n🔄 Convertendo arquivos JSON existentes...")
+        import os
+        json_files = [f for f in os.listdir('.') if f.endswith('.json')]
+        for json_file in json_files:
+            excel_file = json_file.replace('.json', '.xlsx')
+            convert_existing_json_to_excel(json_file, excel_file)
+    
+    else:
+        print("❌ Opção inválida!")
+
+# ============================================
+# EXECUTA O SCRIPT
+# ============================================
+
+if __name__ == "__main__":
+    main()
